@@ -1,0 +1,779 @@
+#######################################################################
+######          Cross-Validation and Spatial Variability         ######
+######                      For Shapefiles                       ######
+######                       06/04/18                            ######
+#######################################################################
+
+#######################################################################
+######                     Setup and data                        ######
+#######################################################################
+######                 Load required libraries                   ######
+
+# As libraries are not always forwards and backwards compatible the verison number
+# is listed besides each library.
+
+require(foreign)  # version 0.8-66
+require(maptools) # version 0.8-39
+require(rgeos)    # version 0.3-17
+require(rgdal)    # version 1.1-3
+require(ggplot2)  # version 2.2.1
+require(plyr)     # version 1.8.3
+require(GGally)   # version 1.3.0
+require(biomod2)  # version 3.1-64
+require(caret)    # version 6.0-64
+require(e1071)    # version 1.6-7
+require(grid)     # version 3.2.3
+require(party)    # version 1.0-25
+require(rpart)    # version 4.1-10
+
+######          Load data and set working directory              ######
+### Set workspace
+setwd("C:/Data") # Input workspace path
+
+### Read training data in from polygon OR point shapefile
+
+## Shapefile must have the following column structure: 
+## Column 1: Class response variable
+## Columns 2-N: Environmental predictors
+
+# Read in polygon shapefile
+shpfile <- readShapePoly("C:/Data.shp") # Enter filepath
+                                      # Data with response variable (classes as factor variable) 
+                                      # in first column, followed by predictors
+
+# Read in point shapefile
+#shpfile <- readShapePoly("filepath") # Enter filepath
+
+# Specify projection for shapefile
+proj4string(shpfile) <- CRS("+proj=utm +zone=30+datum=WGS84")  # "projection_string" # enter proj4 string for shapefile projection information
+
+### Extract dataframe with relevant data from shapefile
+shpdata <- shpfile@data
+str(shpdata)
+
+# Specify the unclassified factor level
+levels(shpdata[[1]])
+unclassified <- "unclassified" # define factor level representing 
+# unclassified polygons/points
+
+# Remove unclassified polygons/points from data used to build and test model
+msk <- shpdata[1] == unclassified
+sdata <- shpdata[!msk,]
+str(sdata)
+summary(sdata)
+
+# Reorder factor variable to remove unused levels - rename levels if required
+sdata[[1]] <- factor(sdata[[1]]) # factor(x, levels, labels = levels)
+
+# Define the number of class levels
+numclass <- nlevels(sdata[[1]])
+
+#### Specify colours to be used for classes in plots, including 'overall' as last class
+
+# View levels
+levels(sdata[[1]])
+# Set colours
+classpal <- "grey40" # All the same level of grey as a default
+#classpal <- c("#FF4040","#E9967A","#FF8C00","#EEDD82","#8B795E") # Define specific 
+
+######                  Model specification                      ######
+
+#### Select modelling method
+modmethod <- "rf"     # specify modelling method - see 'caret' list of availablle models
+# e.g. 'rf', 'knn', 'ctree','rpart', 'treebag' is bagged CART model
+
+### Specify formula and model specific inputs, where appropriate
+fml <- Assigned_c~.            # Specify model formula y~x as appropriate for chosen method
+  
+  ctl <- NULL    # model specific inputs
+
+# e.g, for ctree
+# ctree_control(teststat = "quad",           
+# testtype = "Univariate",
+# mincriterion = 0.90, 
+# minsplit = 3, minbucket = 3,
+# maxdepth = 5)
+
+### Insert number of crossvalidation runs required
+nruns <- 25 
+
+#### Scatterplot matrix for examining correlations between variables 
+
+jpeg("ModelVarsScatterMatrix.jpg",width = 25,height = 20,units = "cm",res = 400)
+require(GGally)
+p <- ggpairs(data=sdata,
+             lower=list(continuous="smooth"),
+             diag=list(continuous= "barDiag"), 
+             upper=list(continuous='cor'))
+
+p
+dev.off()
+
+#######################################################################
+######  Build a set of crossvalidated models with training data  ######
+#######################################################################
+####  Create a list with train and test datasets for the crossvalidation runs
+
+require(caTools)  
+require(vegan)    
+
+Y <- sdata[[1]]
+train.sets <- list()
+test.sets <- list()
+
+for (j in 1:nruns){ 
+  msk= sample.split( Y, SplitRatio = 7/10, group = NULL )### Define the ratio split of training and testing data
+  table(Y, msk)
+  train = sdata[ msk,] 
+  test  = sdata[ !msk,]
+  print(table(Y, msk))
+  
+  train.sets[[j]] <- train
+  test.sets[[j]] <- test
+  next}
+
+### Create a list object with models using the train datasets
+
+## Define model settings
+
+ctrl <- trainControl(method = "none") # No model tuning
+
+## Build a models - use any modelling method that produces outputs for 
+## predicted class and probability of each class and takes
+
+# Make a list object to save models in  
+modlst <- list()
+
+# Model runs
+for (j in 1:nruns){  
+  
+  train <- train.sets[[j]]
+  test <- test.sets[[j]]
+  
+  modlst[j] <- list(mod <- train(fml, 
+                                 data=train, 
+                                 method=modmethod,
+                                 controls = ctl, 
+                                 trControl=ctrl,
+                                 tuneGrid = NULL, 
+                                 tuneLength = 1)) 
+  
+  next
+}
+
+#View models
+modlst
+modlst[[1]]$finalModel
+
+### Model validation
+
+require(caret)
+
+## Make dataframes to save validation results into
+
+# Class specific validation statistics
+class.res <- data.frame(Run=character(0),Class=character(0),
+                        Sens=numeric(0),Spec=numeric(0),BA=numeric(0),
+                        stringsAsFactors =F)
+
+# Validation statistics for whole model
+class.res.all <- data.frame(Run=character(0),
+                            Acc=numeric(0),
+                            NIR=numeric(0),
+                            P=numeric(0),
+                            Kappa=numeric(0),
+                            Q=numeric(0),
+                            A=numeric(0),
+                            stringsAsFactors =F)
+
+# Combined validations statistic
+res.mat.all <- data.frame(ModRun = numeric(),Comb=character(),
+                          Pred=character(),Obs=character(),Vals=numeric(),
+                          stringsAsFactors = FALSE)
+
+## Loop through the models runs to collect validation statistics including 
+## overall accuracy (Acc), no information rate (NIR), p-value (p) for accuracy 
+## exceeding no information rate, Kappa value (Kappa), quantity agreement (Q), 
+## allocation agreement (A), Balanced Accuracy (BA) Specificity (Spec) and 
+## Sensitivity (Sens)
+
+for (i in 1:nruns){   
+  
+  results <- as.data.frame(rownames(test.sets[[i]]))
+  results$actual <- test.sets[[i]][[1]]
+  # Predict class with model i
+  results$predicted <- predict(modlst[[i]],test.sets[[i]]) 
+  names(results) <- c("id", "actual", "predicted")
+  
+  # Calculate confusion matrix for predictions by model i
+  results.matrix <- confusionMatrix(results$predicted, results$actual)
+  results.matrix
+  
+  # Get the number of objects predicted into each class by model i
+  temp.pred <- predict(modlst[[i]],shpdata,type="raw") 
+  pctObj <- as.data.frame(summary(temp.pred)/sum(summary(temp.pred)))
+  
+  # Get values from confusion matrix for model i into a data frame for future plotting
+  rnx <- 1
+  res.mat.0 <- data.frame(ModRun = numeric(),Comb=character(),
+                          Pred=character(),Obs=character(),Vals=numeric(),
+                          ValsP=numeric(),
+                          stringsAsFactors = FALSE)
+  
+  for (r in 1:dim(results.matrix$table)[1]){
+    
+    for (o in 1:dim(results.matrix$table)[2]){
+      rn <- rnx+o-1
+      res.mat.0[rn,1] <- i
+      labt <- paste(r,o,sep="") 
+      res.mat.0[rn,2] <- labt
+      res.mat.0[rn,3] <- levels(train[[1]])[r]
+      res.mat.0[rn,4] <- levels(train[[1]])[o]
+      res.mat.0[rn,5] <- results.matrix$table[r,o]
+      next
+    }
+    
+    CurSel <- res.mat.0[(rn-o+1):rn,]
+    PrVals <- res.mat.0[(rn-o+1):rn,5]
+    totPrCL <- sum(res.mat.0[(rn-o+1):rn,5])
+    
+    res.mat.0[(rn-o+1):rn,6] <- round((PrVals/totPrCL) * pctObj [[1]][r],3)
+    CurSel <- res.mat.0[(rn-o+1):rn,]
+    
+    labt <- paste(r,'U',sep="") 
+    rn <- rn+1
+    res.mat.0[rn,1] <- i
+    res.mat.0[rn,2] <- labt
+    res.mat.0[rn,3] <- levels(train[[1]])[r]
+    res.mat.0[rn,4] <- 'U'
+    res.mat.0[rn,5] <- round(100*(results.matrix$table[r,r]/rowSums(results.matrix$table)[r]),1)
+    res.mat.0[rn,6] <- round(100*(CurSel[CurSel[3]==CurSel[4],6]/sum(CurSel[6])),3)
+    
+    rnx <- rnx+dim(results.matrix$table)[2]+1
+    next
+  }
+  
+  
+  for (o in 1:dim(results.matrix$table)[2]){
+    ObsClassVal <- res.mat.0[res.mat.0[1]==i & res.mat.0[4]==levels(train[[1]])[o] ,]
+    rn <- rnx+o-1
+    res.mat.0[rn,1] <- i
+    labt <- paste('P',o,sep="") 
+    res.mat.0[rn,2] <- labt
+    res.mat.0[rn,3] <- 'P'
+    res.mat.0[rn,4] <- levels(train[[1]])[o]
+    res.mat.0[rn,5] <- round(100*(results.matrix$table[o,o]/colSums(results.matrix$table)[o]),1)
+    res.mat.0[rn,6] <- round(100*(ObsClassVal[ObsClassVal[3]==ObsClassVal[4],6]/sum(ObsClassVal[1:4,6])),1)
+    next
+  }
+  
+  RunValAll <- res.mat.0[res.mat.0[1]==i,]
+  RunValAll$Pred <- factor(RunValAll$Pred,levels = c(levels(train[[1]]),"P","U"))
+  RunValAll$Obs <- factor(RunValAll$Obs,levels = c(levels(train[[1]]),"P","U"))
+  RunValAll$ValsP[is.nan(RunValAll$ValsP) & RunValAll$Pred !="P" & RunValAll$Pred !="U"] <- 0
+  RunValNum <- RunValAll[RunValAll[3]!="P" & RunValAll[4]!="U",]
+  RunValCor <- RunValNum[RunValNum[3]==RunValNum[4],]
+  Psum <- aggregate(ValsP~Pred,data=RunValNum,sum,na.action=na.pass)
+  Osum <- aggregate(ValsP~Obs,data=RunValNum,sum,na.action=na.pass)
+  
+  res.mat.0[rn+1,1] <- i
+  labt <- paste('P','U',sep="") 
+  res.mat.0[rn+1,2] <- labt
+  res.mat.0[rn+1,3] <- 'P'
+  res.mat.0[rn+1,4] <- 'U'
+  res.mat.0[rn+1,5] <- round(100*results.matrix[[3]][[1]],1)
+  res.mat.0[rn+1,6] <- round(100*(sum(RunValCor[6])/sum(RunValNum[6])),3)
+  
+  res.mat.all <- rbind(res.mat.all,res.mat.0)
+  
+  require(matrixStats)
+  sum(2*rowMins(as.matrix(cbind(Osum[2]-RunValCor[6],Psum[2]-RunValCor[6]))))/2
+  
+  # Get overall accuracy measures for model validation run i
+  class.res.all[i,1] <- i
+  class.res.all[i,2] <- results.matrix[[3]][[1]]
+  class.res.all[i,3] <- results.matrix[[3]][[5]]
+  class.res.all[i,4] <- results.matrix[[3]][[6]]
+  class.res.all[i,5] <- results.matrix[[3]][[2]]
+  class.res.all[i,6] <- sum(abs(Osum[2]-Psum[2]))/2
+  class.res.all[i,7] <- sum(2*rowMins(as.matrix(cbind(Osum[2]-RunValCor[6],
+                                                      Psum[2]-RunValCor[6]))))/2
+  
+  class.res.0 <- data.frame(Run=character(0),Class=character(0),
+                            Sens=numeric(0),Spec=numeric(0),BA=numeric(0),
+                            stringsAsFactors =F)
+  
+  # Get class-specific accuracy measures for model validation run i
+  for (j in 1:numclass){
+    
+    class.res.0[j,1] <- i
+    class.res.0[j,2] <- row.names(as.data.frame(results.matrix[[4]]))[j]
+    class.res.0[j,3] <- as.data.frame(results.matrix[[4]])[j,1]
+    class.res.0[j,4] <- as.data.frame(results.matrix[[4]])[j,2]
+    class.res.0[j,5] <- as.data.frame(results.matrix[[4]])[j,8]
+    
+    next
+  }
+  
+  class.res <- rbind(class.res,class.res.0)
+  
+  next
+}
+
+# Print overall accuracy results from all model runs
+class.res.all
+# Print class-specific accuracy results from all model runs
+class.res
+# Print confusion matrix values from all model runs
+res.mat.all
+res.mat.all$ValsP[is.nan(res.mat.all$ValsP) & res.mat.all$Pred !="P" & res.mat.all$Pred !="U"] <- 0
+res.mat.all
+
+### Write results to Excel file
+
+require(xlsx)
+require(rJava)
+require(xlsxjars)
+write.xlsx(class.res.all, "CrossValResults.xlsx", sheetName="OverallAccuracy", 
+           col.names=TRUE, row.names=FALSE, append=FALSE, showNA=TRUE)
+write.xlsx(class.res, "CrossValResults.xlsx", sheetName="ClassAccuracy", 
+           col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+write.xlsx(res.mat.all, "CrossValResults.xlsx", sheetName="Confusion", 
+           col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+
+#######################################################################
+######                     Tables and Plotting                   ######
+#######################################################################
+
+### Separate the main matrix and producers, 
+### users and overall accuracy into different data frames
+res.mat.num <- res.mat.all[res.mat.all[3]!="P" & res.mat.all[4]!="U",]
+res.mat.num <- transform(res.mat.num, 
+                         Pred = factor(Pred, levels=levels(train[[1]])), 
+                         
+                         Obs = factor(Obs, levels=levels(train[[1]])))
+res.mat.up <- res.mat.all[res.mat.all[3]=="P" | res.mat.all[4]=="U",]
+res.mat.up <- transform(res.mat.up, 
+                        Pred = factor(Pred, levels = c(levels(train[[1]]),"P","U")),
+                        Obs = factor(Obs, levels = c(levels(train[[1]]),"P","U")))
+res.mat.up[res.mat.up$Comb=="PU","Comb"] <- "OA"
+highlights <- res.mat.num[res.mat.num[3]==res.mat.num[4],][1:numclass,3:5]
+
+#### Compare between classes ####
+
+# Rename classes for class specific results for consistency
+str(class.res)
+class.res$Class <- as.factor(class.res$Class)
+levels(class.res[[2]])
+levels(class.res[[2]]) <- levels(train[[1]])
+
+# Calculate overall true positives and sensitivity for each model run
+TP <- aggregate(Vals~ModRun,data=res.mat.num[res.mat.num$Pred == res.mat.num$Obs,],sum)
+SEN <- TP[2]/aggregate(Vals~ModRun,data=res.mat.num,sum)[2]
+
+# Calculate overall true negatives and specififity for each model run
+negs <- rep(0,length(unique(res.mat.num[1])[[1]]))
+tnegs <- rep(0,length(unique(res.mat.num[1])[[1]]))
+
+for (i in unique(res.mat.num[3])[[1]]){
+  
+  inegs <- aggregate(Vals~ModRun,data=res.mat.num[res.mat.num$Obs != i,],sum)
+  negs <- negs+inegs[[2]]
+  itnegs <- aggregate(Vals~ModRun,data=res.mat.num[res.mat.num$Obs != i & res.mat.num$Pred != i ,],sum)
+  tnegs <- tnegs+itnegs[[2]]
+  
+  
+  next
+}
+
+SPE <- tnegs/negs
+
+# Calculate overall balanced accuracy for each model run   
+BA <- (SEN+SPE)/2
+
+# Combine values to a matrix
+classrestot <- cbind(1:length(SPE),rep("Overall",length(SPE)),SEN,SPE,BA)
+names(classrestot) <- names(class.res)
+
+# Add overall accuracy values to class specific table
+classvalB <- rbind(class.res,classrestot)
+
+classvalB
+str(classvalB)
+
+# Calculate averages and standard deviations for validation statistics across model runs
+cavevalsB <- aggregate(x = classvalB[3:5], by = list(classvalB$Class), FUN = "mean")
+csdvalsB <- aggregate(x = classvalB[3:5], by = list(classvalB$Class), FUN = "sd")
+
+# Combine values in a table
+BCvalsT <- data.frame(Name=cavevalsB[1],
+                      SENSmean=round(cavevalsB[2],2),
+                      SENSsd=round(csdvalsB[2],2),
+                      SPECmean=round(cavevalsB[3],2),
+                      SPECsd=round(csdvalsB[3],2),
+                      BAmean=round(cavevalsB[4],2),
+                      BAsd=round(csdvalsB[4],2))
+# Rename columns
+names(BCvalsT) <- c("Name","SENSmean","SENSsd","SPECmean","SPECsd",
+                    "BAmean","BAsd")
+# Print table
+BCvalsT
+# Write table to Excel
+write.xlsx(BCvalsT, "CrossValResults.xlsx", sheetName="ClassStats", 
+           col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+
+### Plot the class specific accuracies
+str(classvalB)
+
+require(reshape2)
+plotterBC <-melt(classvalB,id.vars=c(2),measure.vars=c(3:5))
+str(plotterBC)
+levels(plotterBC$variable)
+levels(plotterBC$variable) <- c("Sensitivity","Specificity","Balanced Accuracy")
+
+require(ggplot2)
+require(RColorBrewer)
+ssbp <- ggplot(plotterBC,(aes(x=Class,y=value))) +
+  geom_boxplot(width=0.7,position=position_dodge(width=0.71),fill=classpal) +
+  facet_wrap(~ variable) +
+  ylim(c(0,1)) +
+  ggtitle("Accuracy Statistics Per Class") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y  = element_text(vjust=0.5, size=12,colour="black"),
+        axis.text.x  = element_text(angle=90,vjust=0.5, size=12,colour="black"),
+        axis.title.x  = element_blank(),
+        plot.title =  element_text(size=14,colour="black", face = "bold",vjust=2, hjust = 0.5),
+        strip.background = element_rect(fill="grey40"),
+        strip.text.x = element_text(size=14, face="bold",colour="white"),
+        panel.grid.major = element_line(colour="grey80"),
+        panel.grid.minor = element_line(colour="grey80"),
+        panel.background = element_rect(fill="white"))
+
+#### Look at the Whole classification ####
+class.res.all
+classvalB.all <- data.frame(class.res.all,Sens=SEN[[1]],Spec=SPE,BA=BA[[1]])
+
+# Calculate averages and standard deviations for validation statistics
+callavevalsB <- colMeans(classvalB.all[2:10])
+callsdvalsB <- colSds(as.matrix(classvalB.all[2:10]))
+
+# Combine values in a table
+BCallvalsT <- data.frame(Accmean=round(callavevalsB[1],2),
+                         Accsd=round(callsdvalsB[1],2),
+                         Pmean=round(callavevalsB[3],2),
+                         Psd=round(callsdvalsB[3],2),
+                         Kmean=round(callavevalsB[4],2),
+                         Ksd=round(callsdvalsB[4],2),
+                         Qmean=round(callavevalsB[5],2),
+                         Qsd=round(callsdvalsB[5],2),
+                         Amean=round(callavevalsB[6],2),
+                         Asd=round(callsdvalsB[6],2),
+                         Sensmean=round(callavevalsB[7],2),
+                         Senssd=round(callsdvalsB[7],2),
+                         Specmean=round(callavevalsB[8],2),
+                         Specsd=round(callsdvalsB[8],2),
+                         BAmean=round(callavevalsB[9],2),
+                         BAsd=round(callsdvalsB[9],2))
+
+# Rename columns
+names(BCallvalsT) <- c("Accmean","Accsd","Pmean","Psd","Kmean","Ksd",
+                       "Qmean","Qsd","Amean","Asd","Sensmean","Senssd",
+                       "Specmean","Specsd","BAmean","BAsd")
+
+# Print table
+BCallvalsT
+# Write table to Excel
+write.xlsx(BCallvalsT, "CrossValResults.xlsx", sheetName="ModelStats", 
+           col.names=TRUE, row.names=FALSE, append=TRUE, showNA=TRUE)
+
+### Plot the range of whole modelvalidation statistics
+
+## Reshape the dataframe for plotting
+require(reshape2)
+str(classvalB.all)
+plotterBCA <-melt(classvalB.all,id.vars=c(1),measure.vars=c(2,3,5:10))
+str(plotterBCA)
+levels(plotterBCA$variable)
+levels(plotterBCA$variable) <- c("Accuracy","NIR","Kappa","Q","A","Sensitivity",
+                                 "Specificity","Balanced Accuracy")
+
+## Overall accuracy and Kappa stastistic plot - ranges from crossvalidation runs
+
+# Extract Accuracy and Kappa values
+plotterBCA2 <- plotterBCA[plotterBCA$variable=="Accuracy"|plotterBCA$variable=="Kappa",]
+# Extract NIR value
+linevar <- data.frame(variable=c("Accuracy"),Z=mean(plotterBCA[plotterBCA$variable=="NIR",3]))
+
+# Boxplots
+ssbpa <- ggplot(plotterBCA2,(aes(x=variable,y=value))) +
+  geom_boxplot(width=0.7,position=position_dodge(width=0.71),fill="grey40") +
+  geom_hline(data=linevar,aes(yintercept=Z), 
+             colour="gray24",
+             size=0.6,
+             linetype=2) +
+  facet_wrap(~ variable,nrow=1,scales = "free_x") +
+  ylim(c(0,1)) +
+  ggtitle("Overall Accuracy Statistics") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y  = element_text(vjust=0.5, size=12,colour="black"),
+        axis.text.x  = element_blank(),
+        axis.title.x  = element_blank(),
+        plot.title =  element_text(size=14,colour="black", face = "bold",vjust=2, hjust = 0.5),
+        strip.background = element_rect(fill="grey40"),
+        strip.text.x = element_text(size=14, face="bold",colour="white"),
+        panel.grid.major = element_line(colour="grey80"),
+        panel.grid.minor = element_line(colour="grey80"),
+        panel.background = element_rect(fill="white"),
+        plot.margin = unit(c(0.2, 1,1.6 ,0.3), "cm")) #top, right, bottom, left
+
+### Combine class specific and overall classification plots
+
+# Set up the page for layout 1
+require(grid)
+lo.main <- nlevels(plotterBC[[1]])*1.1*3
+jw <- lo.main + 7
+
+jpeg("AccStats.jpg", width = jw, units = "cm",height = 8,res = 400)
+grid.newpage()
+# Define layout
+pushViewport(viewport(layout = grid.layout(1,2,
+                                           heights=unit(c(8),c("cm")),
+                                           widths=unit(c(lo.main,7), "cm"))))
+# Add plots to layout
+print(ssbp,
+      vp = viewport(layout.pos.row = 1,
+                    layout.pos.col = 1))
+print(ssbpa, vp = viewport(layout.pos.row = 1,
+                           layout.pos.col = 2))
+dev.off()
+
+######          Plot of confusion matrix and accuracies          ######
+
+### Define the plot of main confusion matrix
+
+## Main plot
+p <-  ggplot(res.mat.num,(aes(x=Obs,y=Vals))) +
+  geom_boxplot(width=0.7,fill="grey70") +
+  facet_grid(Pred~Obs, scales = "free_x") +
+  xlab("") +
+  ylab("Predicted\n ") +
+  ggtitle("Observed\n ") + 
+  theme(axis.title.y = element_text(size=13,colour="black", face = "bold",vjust=2),
+        axis.text.y  = element_text(vjust=0.5, size=13,colour="black"),
+        axis.text.x  = element_blank(),
+        axis.title.x  = element_text(size=13,colour="black", face = "bold",vjust=0),
+        plot.title =  element_text(size=13,colour="black", face = "bold",vjust=0.7, hjust = 0.5),
+        strip.text.x = element_text(size=13, face="bold",colour="white"),
+        strip.text.y = element_text(size=13, face="bold",colour="white"),
+        strip.background = element_rect(fill="grey30"),
+        panel.grid.major = element_line(colour="grey90"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill="white",color="grey30", 
+                                        size=0.5, linetype="solid"),
+        plot.margin = unit(c(0.5, 0, 0,0.7), "cm"))
+p
+
+## Add shading to diagonal
+fillcol <- "grey28"     # Define based on contrast
+p1 <- p + geom_rect(data=highlights,aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf), 
+                    fill=fillcol, alpha=0.3) +
+  geom_boxplot(data=res.mat.num,aes(x=Obs,y=Vals),width=0.7,fill="grey70")
+p1
+
+## Add averages as numbers to plot
+# Dataframe with averages ad plotting locations
+aggdata <-aggregate(res.mat.num$Vals, by=list(res.mat.num$Pred,res.mat.num$Obs), 
+                    FUN=mean, na.rm=TRUE)
+names(aggdata) <- c("Pred", "Obs","labs")
+aggdata$labs <- round(aggdata$labs,1)
+len <- nrow(aggdata)
+dat <- data.frame(x = rep(1, len), y = rep(max(res.mat.num$Vals)/2, len), aggdata)
+# Add to plot
+p1 <- p1 + geom_text(aes(x, y, label=format(labs,round(labs,digits = 1)), group=NULL),data=dat)
+
+p1
+### Define plot of the ranges of users accuracies
+p2 <-  ggplot(res.mat.up[grep("P",res.mat.up$Comb),],(aes(x=Comb,y=Vals))) +
+  geom_boxplot(width=0.7,position=position_dodge(width=0.71),fill="grey70") +
+  expand_limits(y=c(0,100)) +
+  facet_wrap(~Comb, nrow = 1,scales = "free_x") +
+  ylab("Producer's \n Accuracy %") +
+  ggtitle("  ") + 
+  theme(axis.title.y = element_text(size=13,colour="black", face = "bold",vjust=1.7),
+        axis.text.y  = element_text(vjust=0.5, size=13,colour="black"),
+        axis.title.x = element_blank(),
+        axis.text.x  = element_blank(),
+        plot.title =  element_text(size=18,colour="black", face = "bold",vjust=2),
+        strip.text.x = element_blank(),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        panel.grid.major = element_line(colour="grey90"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill="white",color="grey30", size=0.5, linetype="solid"),
+        plot.margin = unit(c(0.5, 0.7, 0.3, 0.5), "cm"))
+p2
+
+### Define plot of the ranges of producers accuracies
+p3 <-  ggplot(res.mat.up[grep("U",res.mat.up$Comb),],(aes(x=Comb,y=Vals))) +
+  geom_boxplot(width=0.7,position=position_dodge(width=0.71),fill="grey70") +
+  expand_limits(y=c(0,100)) +
+  facet_wrap(~Comb, ncol=1,scales = "free_x") +
+  ggtitle("User's \n Accuracy %\n \n ") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y  = element_text(vjust=0.5, size=13,colour="black"),
+        axis.title.x = element_blank(),
+        axis.text.x  = element_blank(),
+        plot.title =  element_text(size=13,colour="black", face = "bold",vjust=0, hjust = 0.5),
+        strip.text.x = element_blank(),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        panel.grid.major = element_line(colour="grey90"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill="white",color="grey30", 
+                                        size=0.5, linetype="solid"),
+        panel.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm"),
+        plot.margin = unit(c(0.3, 0.5, 0.5, 0.5), "cm"))
+p3
+
+### Define plot of the ranges of overall accuracy
+p4 <-  ggplot(res.mat.up[grep("OA",res.mat.up$Comb),],(aes(x=Comb,y=Vals))) +
+  geom_boxplot(width=0.7,position=position_dodge(width=0.71),fill="grey70") +
+  expand_limits(y=c(0,100)) +
+  facet_wrap(~Comb, ncol=1,scales = "free_x") +
+  ggtitle("Overall \n Accuracy %") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y  = element_text(vjust=0.5, size=13,colour="black"),
+        axis.title.x = element_blank(),
+        axis.text.x  = element_blank(),
+        plot.title =  element_text(size=13,colour="black", face = "bold",vjust=0, hjust = 0.5),
+        strip.text.x = element_blank(),
+        strip.text.y = element_blank(),
+        strip.background = element_blank(),
+        panel.grid.major = element_line(colour="grey90"),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill="white",color="grey30", 
+                                        size=0.5, linetype="solid"),
+        panel.margin = unit(c(-0.5, -0.35, -0.5, -0.35), "cm"),
+        plot.margin = unit(c(0.1, 0.5, 0.3, 0.2), "cm"))
+p4
+
+
+## Combine the plots into a single layout
+
+# Set up the page
+require(grid)
+sq.main <- nlevels(plotterBC[[1]])*3
+jhw <- sq.main +4
+
+jpeg("ConfMatrix.jpg",width = jhw,height = jhw,units = "cm",res=400)
+grid.newpage()
+# Define layout
+pushViewport(viewport(layout = grid.layout(2,2,
+                                           heights=unit(c(sq.main, 4),c("cm")),
+                                           widths=unit(c(sq.main, 4), "cm"))))
+# Add plots to layout
+print(p1,
+      vp = viewport(layout.pos.row = 1,
+                    layout.pos.col = 1))
+print(p3, vp = viewport(layout.pos.row = 1,
+                        layout.pos.col = 2))
+print(p2, vp = viewport(layout.pos.row = 2,
+                        layout.pos.col = 1))
+print(p4, vp = viewport(layout.pos.row = 2,
+                        layout.pos.col = 2))
+dev.off()
+
+#######################################################################
+######           Predictions and Spatial Variability             ######
+#######################################################################
+
+#### Predict to unclassified polygons ####
+
+### Create a mask for unclassified polygons
+msk <- shpdata[1] == unclassified
+
+## Define model and output variables
+
+### Make objects to store crossvalidation predictions
+modproSQ <- data.frame(shpdata[1])
+modproSQP <- list()
+
+### Add predictions for each crossvalidation models into outputs
+
+for (i in 1:length(modlst)){
+  
+  # Predict
+  modproSQ[i] <- predict(modlst[[i]],shpdata,type="raw")
+  names(modproSQ)[i] <- paste('Mod',i,sep='')
+  modproSQP[[i]] <- predict(modlst[[i]],shpdata,type="prob")
+  
+  next
+}
+
+## Calculate most frequent class and its frequency
+
+MaxFclass <- data.frame(x=1)
+
+for (i in 1:nrow(modproSQ)){
+  vec <- unname(unlist(modproSQ[i,]))
+  MaxFClass0 <- summary(vec)/sum(summary(vec))
+  
+  for (j in 1:length(MaxFClass0)){
+    MaxFclass[i,j] <- MaxFClass0[[j]]
+    next
+  }
+  
+  MaxFclass[i,j+1] <- as.character(names(which.max(summary(vec)/sum(summary(vec)))))
+  MaxFclass[i,j+2] <- max(MaxFClass0)
+  
+  next
+}
+
+namevec <- c(levels(sdata[[1]]),'MaxClass','MaxClassF')
+names(MaxFclass) <- namevec
+str(MaxFclass)
+
+head(MaxFclass)
+
+## Calculate average probabilities for classes
+
+modproSQPsums <- Reduce("+", modproSQP)
+
+AvePclass <- modproSQPsums / nruns
+
+### Find average probability of maximum frequency class
+
+# Column number for column to add
+newcol <- ncol(AvePclass)+1
+
+# Loop through each row for extracting the probability value of the most frequent class
+for (i in 1:nrow(AvePclass)){
+  vec <- unname(unlist(modproSQ[i,]))
+  MaxFClass0 <- summary(vec)/sum(summary(vec))
+  mx <- which.max(summary(vec)/sum(summary(vec)))
+  AvePclass[i,newcol] <- AvePclass[i,mx]
+  
+  next
+}
+
+# Rename the new column
+names(AvePclass)[newcol] <- 'MaxFclMeanProb'
+# Check data frame
+head(AvePclass)
+
+## Calculate new vector for frequency x probability
+CombConf <- MaxFclass[ncol(MaxFclass)] * AvePclass[ncol(AvePclass)]
+# Rename
+names(CombConf) <- 'CombConf'
+# Check data frame
+head(CombConf)
+
+## Add new columns to shapefile data: last two columns of MaxFclass (Max class and its frequency) and last column 
+## of AvePclass (the average probability of the most frequent class) and the combined 'confidence score'
+shpfile@data <- cbind(shpfile@data,MaxFclass[(ncol(MaxFclass)-1):ncol(MaxFclass)],AvePclass[ncol(AvePclass)],CombConf)
+
+# Check data frame
+shpfile@data[1:20,]
+
+## Write out a new shapefile (but without .prj)
+writePolyShape(shpfile, "Output_Objects_Prediction") # Insert file name
